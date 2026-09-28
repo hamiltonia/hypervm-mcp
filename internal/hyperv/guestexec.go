@@ -20,6 +20,18 @@ type GuestResult struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+// GuestCopyFromResult describes a guest-to-host copy and the digest verified on
+// both sides of the VMBus transfer.
+type GuestCopyFromResult struct {
+	VMName           string `json:"vm_name"`
+	Source           string `json:"source"`
+	Destination      string `json:"destination"`
+	SizeBytes        int64  `json:"size_bytes"`
+	SHA256           string `json:"sha256"`
+	LastWriteTimeUTC string `json:"last_write_time_utc"`
+	Overwritten      bool   `json:"overwritten"`
+}
+
 // GuestInvokeCommand runs a command in a Windows guest over PowerShell Direct.
 //
 // This path uses the VMBus rather than the network, so it works on a VM with no
@@ -93,8 +105,8 @@ func (c *Client) GuestInvokeCommand(ctx context.Context, vmName, command, userna
 // switched off. On Linux guests that component is the hypervfcopyd daemon from
 // the hyperv-daemons package.
 //
-// Only host to guest is supported; Hyper-V offers no reverse. For the other
-// direction use SSHExec, or open a tunnel.
+// Copy-VMFile itself is host to guest. GuestCopyFrom implements the Windows
+// guest-to-host direction separately over PowerShell Direct.
 func (c *Client) GuestCopyFile(ctx context.Context, vmName, source, destination string, createFullPath, overwrite bool) error {
 	if vmName == "" || destination == "" {
 		return hverr.New(hverr.InvalidArgument, "vm_name and destination_path are required")
@@ -140,4 +152,83 @@ func (c *Client) GuestCopyFile(ctx context.Context, vmName, source, destination 
 		"overwrite":        overwrite,
 	})
 	return err
+}
+
+// GuestCopyFrom copies one file from a Windows guest to the host over
+// PowerShell Direct. Directories are deliberately unsupported; callers can
+// archive them inside the guest first.
+func (c *Client) GuestCopyFrom(ctx context.Context, vmName, source, stagingPath, username, password string, timeout time.Duration) (*GuestCopyFromResult, error) {
+	switch {
+	case vmName == "":
+		return nil, hverr.New(hverr.InvalidArgument, "vm_name is required")
+	case source == "":
+		return nil, hverr.New(hverr.InvalidArgument, "source_path is required")
+	case username == "" || password == "":
+		return nil, hverr.New(hverr.CredentialNotFound,
+			"PowerShell Direct needs a username and password for %q", vmName).
+			WithDetail("Store them with `hypervm-mcp cred set`, or pass them in the call. " +
+				"A key is not enough: PowerShell Direct authenticates with a password.")
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+
+	stage, err := winpath.ValidateFileDestination(stagingPath, false)
+	if err != nil {
+		return nil, err
+	}
+
+	const script = requireVM + `
+    if ($vm.State -ne 'Running') {
+        throw "HVERR:VM_WRONG_STATE|'$($P.name)' is $($vm.State); PowerShell Direct needs a running VM"
+    }
+
+    $sec  = ConvertTo-SecureString $P.password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($P.username, $sec)
+    $session = $null
+
+    try {
+        $session = New-PSSession -VMId $vm.Id -Credential $cred
+        $guest = Invoke-Command -Session $session -ScriptBlock {
+            param([string]$source)
+            $item = Get-Item -LiteralPath $source -Force
+            if ($item.PSIsContainer) {
+                throw "HVERR:INVALID_ARGUMENT|'$source' is a directory; archive it in the guest and copy the archive"
+            }
+            [pscustomobject]@{
+                size_bytes          = [int64]$item.Length
+                sha256              = [string](Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                last_write_time_utc = $item.LastWriteTimeUtc.ToString('o')
+            }
+        } -ArgumentList $P.source
+
+        Copy-Item -FromSession $session -LiteralPath $P.source -Destination $P.staging -Force
+        $hostItem = Get-Item -LiteralPath $P.staging -Force
+        $hostHash = [string](Get-FileHash -LiteralPath $P.staging -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ([int64]$hostItem.Length -ne [int64]$guest.size_bytes -or $hostHash -ne [string]$guest.sha256) {
+            throw "HVERR:INTERNAL|the copied file did not match the guest size and SHA256"
+        }
+
+        $result = [ordered]@{
+            vm_name             = $P.name
+            source              = $P.source
+            size_bytes          = [int64]$guest.size_bytes
+            sha256              = [string]$guest.sha256
+            last_write_time_utc = [string]$guest.last_write_time_utc
+        }
+    } finally {
+        if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+    }`
+
+	var out GuestCopyFromResult
+	if err := c.r.RunTimeoutInto(ctx, timeout, script, map[string]any{
+		"name":     vmName,
+		"source":   source,
+		"staging":  stage,
+		"username": username,
+		"password": password,
+	}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

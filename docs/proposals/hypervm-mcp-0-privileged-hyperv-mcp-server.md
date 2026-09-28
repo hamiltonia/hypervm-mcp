@@ -1227,9 +1227,9 @@ func GuestInvokeCommand(ctx context.Context, in GuestInvokeInput) (*GuestResult,
 
 // GuestCopyFile copies a file from the host into the guest using Copy-VMFile,
 // which requires the Guest Service Interface integration component; this function
-// enables it automatically when disabled. Only host-to-guest is supported;
-// Hyper-V provides no guest-to-host equivalent. For the reverse direction use
-// SSHExec with a shell redirect, or open a tunnel.
+// enables it automatically when disabled. Copy-VMFile itself is host-to-guest
+// only. GuestCopyFrom handles the reverse for Windows guests with a PowerShell
+// Direct session and Copy-Item -FromSession.
 //
 // The source path is read by the service as LocalSystem, so the LocalSystem path
 // rules apply: no mapped drive letters.

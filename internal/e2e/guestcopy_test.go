@@ -68,8 +68,7 @@ func TestGuestCopyFile(t *testing.T) {
 		t.Fatalf("guest_copy_file: %v", err)
 	}
 
-	// Read it back over SSH: the copy went one way over the VMBus, and Hyper-V
-	// offers nothing for the reverse.
+	// Read it back over SSH because guest_copy_from is Windows-only.
 	got := sshRun(t, session, ctx, host, "cat "+dest)
 	if got != content {
 		t.Fatalf("the guest has %q, want %q", got, content)

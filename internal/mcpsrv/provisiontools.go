@@ -13,6 +13,8 @@ import (
 const pathRules = "\n\nPaths are opened by the service, which runs as LocalSystem. " +
 	"Mapped drive letters (Z:\\) do not exist in its logon session and are rejected; " +
 	"use a UNC path and grant the computer account access to the share. " +
+	"Device paths and reparse-point destinations are rejected. " +
+	"Guest-to-host copies create and replace files as the connected user, not as LocalSystem. " +
 	"Paths are checked before anything is created, so a bad one fails cleanly."
 
 type createVMInput struct {

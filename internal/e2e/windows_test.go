@@ -4,6 +4,8 @@ package e2e
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -313,6 +315,7 @@ func TestWindowsGuestCopyFile(t *testing.T) {
 	if err := os.MkdirAll(hostDir, 0o755); err != nil {
 		t.Fatalf("create %s: %v", hostDir, err)
 	}
+
 	src := filepath.Join(hostDir, "win-copy-probe.txt")
 	content := "copied over the VMBus at " + time.Now().UTC().Format(time.RFC3339)
 	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
@@ -339,6 +342,86 @@ func TestWindowsGuestCopyFile(t *testing.T) {
 	t.Logf("file arrived intact at %s", dest)
 
 	winExec(t, session, ctx, `Remove-Item -Recurse -Force 'C:\hypervm-mcp'; 'cleaned'`, 120)
+}
+
+// TestWindowsGuestCopyFrom retrieves a known file over PowerShell Direct,
+// verifies the digest reported by the tool, and exercises both overwrite paths.
+func TestWindowsGuestCopyFrom(t *testing.T) {
+	requireWindowsGuest(t)
+	session, _ := connect(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	privateKey, _ := sshKeyPair(t)
+	storeCredentialsAs(t, winVMName, winAdmin, winPassword, privateKey)
+
+	const guestPath = `C:\hypervm-mcp\copy-from-probe.txt`
+	hostDir := filepath.Join(rockyArtifact, "guest-copy-from")
+	hostPath := filepath.Join(hostDir, "retrieved.txt")
+	_ = os.RemoveAll(hostDir)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(hostDir)
+		_, _ = winExecErr(session, context.Background(),
+			`Remove-Item -LiteralPath '`+guestPath+`' -Force -ErrorAction SilentlyContinue`, 120)
+	})
+
+	writeGuest := func(content string) {
+		t.Helper()
+		encoded := base64.StdEncoding.EncodeToString([]byte(content))
+		winExec(t, session, ctx,
+			`[IO.Directory]::CreateDirectory('C:\hypervm-mcp') | Out-Null; `+
+				`[IO.File]::WriteAllBytes('`+guestPath+`',[Convert]::FromBase64String('`+encoded+`')); 'written'`,
+			120)
+	}
+
+	first := "known guest payload\n"
+	writeGuest(first)
+	var copied struct {
+		SizeBytes   int64  `json:"size_bytes"`
+		SHA256      string `json:"sha256"`
+		Overwritten bool   `json:"overwritten"`
+	}
+	call(t, session, ctx, "guest_copy_from", map[string]any{
+		"vm_name":          winVMName,
+		"source_path":      guestPath,
+		"destination_path": hostPath,
+		"create_parents":   true,
+	}, &copied)
+
+	got, err := os.ReadFile(hostPath)
+	if err != nil {
+		t.Fatalf("read retrieved file: %v", err)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte(first)))
+	if string(got) != first || copied.SizeBytes != int64(len(first)) ||
+		copied.SHA256 != wantHash || copied.Overwritten {
+		t.Fatalf("copy metadata/content mismatch: content=%q result=%+v want sha256=%s", got, copied, wantHash)
+	}
+
+	if err := tryCall(t, session, ctx, "guest_copy_from", map[string]any{
+		"vm_name":          winVMName,
+		"source_path":      guestPath,
+		"destination_path": hostPath,
+	}); err == nil || !strings.Contains(err.Error(), "VM_ALREADY_EXISTS") {
+		t.Fatalf("copy without overwrite got %v, want VM_ALREADY_EXISTS", err)
+	}
+
+	second := "replacement guest payload\n"
+	writeGuest(second)
+	call(t, session, ctx, "guest_copy_from", map[string]any{
+		"vm_name":          winVMName,
+		"source_path":      guestPath,
+		"destination_path": hostPath,
+		"overwrite":        true,
+	}, &copied)
+	got, err = os.ReadFile(hostPath)
+	if err != nil {
+		t.Fatalf("read overwritten file: %v", err)
+	}
+	wantHash = fmt.Sprintf("%x", sha256.Sum256([]byte(second)))
+	if string(got) != second || copied.SHA256 != wantHash || !copied.Overwritten {
+		t.Fatalf("overwrite mismatch: content=%q result=%+v want sha256=%s", got, copied, wantHash)
+	}
 }
 
 // TestWindowsStaticIP walks the Windows branch of set_guest_static_ip.

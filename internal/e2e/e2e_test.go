@@ -56,7 +56,7 @@ func TestToolsAreAdvertised(t *testing.T) {
 	want := map[string]bool{
 		"list_vms": false, "get_vm": false, "start_vm": false, "stop_vm": false,
 		"restart_vm": false, "suspend_vm": false, "resume_vm": false,
-		"wait_for_guest_ip": false,
+		"wait_for_guest_ip": false, "guest_copy_from": false,
 	}
 	for _, tool := range res.Tools {
 		t.Logf("  %-20s %s", tool.Name, tool.Title)

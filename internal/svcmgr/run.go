@@ -197,7 +197,11 @@ func (p *program) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	srv := mcpsrv.New(p.version, p.deps)
+	deps := *p.deps
+	deps.Impersonate = func(fn func() error) error {
+		return winsec.WithNamedPipeClient(conn, fn)
+	}
+	srv := mcpsrv.New(p.version, &deps)
 	transport := &mcp.IOTransport{
 		Reader: io.NopCloser(reader),
 		Writer: nopWriteCloser{conn}, // conn is closed once, by the defer above

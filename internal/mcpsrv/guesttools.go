@@ -2,12 +2,15 @@ package mcpsrv
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/heavycaffeiner/hypervm-mcp/internal/config"
 	"github.com/heavycaffeiner/hypervm-mcp/internal/hverr"
 	"github.com/heavycaffeiner/hypervm-mcp/internal/hyperv"
+	"github.com/heavycaffeiner/hypervm-mcp/internal/winpath"
 )
 
 type guestInvokeInput struct {
@@ -56,6 +59,17 @@ type guestCopyInput struct {
 	DestinationPath string `json:"destination_path" jsonschema:"Where to put it inside the guest."`
 	CreateFullPath  bool   `json:"create_full_path,omitempty" jsonschema:"Create missing directories in the guest."`
 	Overwrite       bool   `json:"overwrite,omitempty" jsonschema:"Replace an existing file."`
+}
+
+type guestCopyFromInput struct {
+	VMName          string `json:"vm_name" jsonschema:"Exact name of the Windows VM."`
+	SourcePath      string `json:"source_path" jsonschema:"One file inside the guest to copy."`
+	DestinationPath string `json:"destination_path" jsonschema:"Absolute host file path to create."`
+	CreateParents   bool   `json:"create_parents,omitempty" jsonschema:"Create missing host parent directories."`
+	Overwrite       bool   `json:"overwrite,omitempty" jsonschema:"Replace an existing host file. Default false."`
+	Username        string `json:"username,omitempty" jsonschema:"Overrides the stored username."`
+	Password        string `json:"password,omitempty" jsonschema:"Overrides the stored password."`
+	TimeoutSeconds  int    `json:"timeout_seconds,omitempty" jsonschema:"Default 300."`
 }
 
 // guestCredentials fills in whatever the caller left out from the store.
@@ -224,8 +238,7 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			"It does need the Guest Service Interface integration component, which this enables if it " +
 			"is switched off — on Linux that component is hypervfcopyd from the hyperv-daemons " +
 			"package.\n\n" +
-			"Only host to guest; Hyper-V offers nothing for the reverse. To bring a file back, use " +
-			"ssh_exec or a tunnel." + pathRules,
+			"For the reverse direction from a Windows guest, use guest_copy_from." + pathRules,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in guestCopyInput) (*mcp.CallToolResult, map[string]any, error) {
 		err := d.VM.GuestCopyFile(ctx, in.VMName, in.SourcePath, in.DestinationPath,
 			in.CreateFullPath, in.Overwrite)
@@ -237,6 +250,78 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			"vm_name":     in.VMName,
 			"destination": in.DestinationPath,
 		}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "guest_copy_from",
+		Title: "Copy a file out of a Windows guest without networking",
+		Description: "Copy one file from a running Windows guest to the host over PowerShell Direct " +
+			"and the VMBus, so it needs no guest network.\n\n" +
+			"Windows guests only. This uses the stored PowerShell Direct credentials unless username " +
+			"or password overrides are supplied. Directories are not copied recursively; archive one " +
+			"inside the guest first, then retrieve the archive.\n\n" +
+			"overwrite defaults to false. create_parents defaults to false. The result includes the " +
+			"guest file size and SHA256, both verified against the host copy." + pathRules,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in guestCopyFromInput) (*mcp.CallToolResult, *hyperv.GuestCopyFromResult, error) {
+		user, pass, err := guestCredentials(d, in.VMName, in.Username, in.Password)
+		if err != nil {
+			return nil, nil, err
+		}
+		if d.Impersonate == nil {
+			return nil, nil, hverr.New(hverr.Internal,
+				"the service did not provide a client impersonation context")
+		}
+
+		var target *winpath.FileDestination
+		err = d.Impersonate(func() error {
+			var prepareErr error
+			target, prepareErr = winpath.PrepareFileDestination(
+				in.DestinationPath, in.CreateParents, in.Overwrite)
+			return prepareErr
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		defer func() {
+			_ = d.Impersonate(target.Cleanup)
+		}()
+
+		serviceStage, err := os.CreateTemp(config.DataDir(), ".guest-copy-from-*.tmp")
+		if err != nil {
+			return nil, nil, hverr.Wrap(hverr.PathNotAccessible, err,
+				"could not create protected guest-copy staging file")
+		}
+		serviceStagePath := serviceStage.Name()
+		if err := serviceStage.Close(); err != nil {
+			os.Remove(serviceStagePath)
+			return nil, nil, hverr.Wrap(hverr.PathNotAccessible, err,
+				"could not close protected guest-copy staging file")
+		}
+		defer os.Remove(serviceStagePath)
+
+		out, err := d.VM.GuestCopyFrom(ctx, in.VMName, in.SourcePath, serviceStagePath,
+			user, pass, time.Duration(in.TimeoutSeconds)*time.Second)
+		if err != nil {
+			return nil, nil, err
+		}
+		serviceStage, err = os.Open(serviceStagePath)
+		if err != nil {
+			return nil, nil, hverr.Wrap(hverr.PathNotAccessible, err,
+				"could not open protected guest-copy staging file")
+		}
+		defer serviceStage.Close()
+
+		if err := d.Impersonate(func() error {
+			if err := target.CopyFrom(serviceStage); err != nil {
+				return err
+			}
+			return target.Commit()
+		}); err != nil {
+			return nil, nil, err
+		}
+		out.Destination = target.Path
+		out.Overwritten = target.Existed
+		return nil, out, err
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
