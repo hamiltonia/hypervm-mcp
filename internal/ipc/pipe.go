@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -46,7 +47,7 @@ func Listen(pipePath, sddl string) (net.Listener, error) {
 func Dial(ctx context.Context, pipePath string) (net.Conn, error) {
 	deadline := time.Now().Add(dialRetryWindow)
 	for {
-		conn, err := winio.DialPipeContext(ctx, pipePath)
+		conn, err := dialPipe(ctx, pipePath)
 		if err == nil {
 			return conn, nil
 		}
@@ -66,7 +67,13 @@ func Dial(ctx context.Context, pipePath string) (net.Conn, error) {
 // DialOnce attempts a single connection. Diagnostics use it so "the service is
 // not installed" is reported as such instead of as a retry timeout.
 func DialOnce(ctx context.Context, pipePath string) (net.Conn, error) {
-	return winio.DialPipeContext(ctx, pipePath)
+	return dialPipe(ctx, pipePath)
+}
+
+func dialPipe(ctx context.Context, pipePath string) (net.Conn, error) {
+	return winio.DialPipeAccessImpLevel(ctx, pipePath,
+		uint32(windows.GENERIC_READ|windows.GENERIC_WRITE),
+		winio.PipeImpLevelImpersonation)
 }
 
 // Frame kinds distinguish the two protocols sharing this pipe.

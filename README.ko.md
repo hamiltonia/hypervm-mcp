@@ -365,7 +365,7 @@ LocalSystem으로 돌기 때문에, 당신이 연결한 네트워크 드라이�
 | 도구 | |
 |---|---|
 | `ssh_exec` `ssh_info` `ssh_forget_host_key` | SSH로 명령 실행. 호스트 키는 VM별로 고정 |
-| `guest_invoke_command` `guest_copy_file` | VMBus 경유. 게스트 네트워크가 전혀 없어도 |
+| `guest_invoke_command` `guest_copy_file` `guest_copy_from` | VMBus 경유. 게스트 네트워크가 전혀 없어도 |
 | `guest_run_in_session` | 게스트 데스크톱에서, 권한 상승된 상태로. 창이 그려지는 곳 |
 | `capture_vm_screen` | 콘솔 화면 캡처. 게스트 안에 아무것도 필요 없음 |
 | `send_vm_key` `send_vm_mouse` | 콘솔 자체의 키보드와 포인터 |
@@ -448,6 +448,7 @@ guest_invoke_command  vm_name=win-test
 | `guest_invoke_command` | PowerShell Direct | Windows 전용. Linux는 `ssh_exec` |
 | `guest_run_in_session` | PowerShell Direct와 데스크톱 | Windows 전용 |
 | `guest_copy_file` | Guest Service Interface | 둘 다. Linux는 `hypervfcopyd` 필요 |
+| `guest_copy_from` | PowerShell Direct | Windows 전용. 한 번에 파일 하나 |
 
 `capture_vm_screen`에 `width`/`height`를 주지 않으면 콘솔 자신의 해상도를 씁니다.
 언제나 받아들여지는 유일한 크기입니다. 1세대 펌웨어 화면은 640x480 언저리로,
@@ -653,6 +654,7 @@ Windows 11 위의 **Rocky Linux 10** 대상:
 | `guest_invoke_command` | 게스트에 네트워크 서비스가 생기기 전에 VMBus 위의 PowerShell Direct로 |
 | SSH 부트스트랩 | OpenSSH 설치, 시작, 키 등록, 방화벽 설정을 전부 VMBus로 처리한 뒤 TCP로 접속 |
 | `guest_copy_file` | VMBus로 호스트에서 게스트로 |
+| `guest_copy_from` | VMBus로 게스트에서 호스트로. 크기와 SHA256 검증 |
 | `set_guest_static_ip` | Windows 분기를, `Ethernet 2`라는 두 번째 어댑터에서 |
 | 세션 브리지 | 같은 질의를 PowerShell Direct의 세션 0과 `guest_run_in_session`의 세션 1에서 각각 응답 |
 | 권한 상승 | 그 세션에서 필터링되지 않은 관리자 토큰. `HKLM` 아래 쓰기로 증명 |

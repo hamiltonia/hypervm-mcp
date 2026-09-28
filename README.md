@@ -369,7 +369,7 @@ something by name.
 | Tool | |
 |---|---|
 | `ssh_exec` `ssh_info` `ssh_forget_host_key` | Commands over SSH, host keys pinned per VM |
-| `guest_invoke_command` `guest_copy_file` | Over the VMBus, with no guest network at all |
+| `guest_invoke_command` `guest_copy_file` `guest_copy_from` | Over the VMBus, with no guest network at all |
 | `guest_run_in_session` | On the guest's desktop, elevated, where windows are drawn |
 | `capture_vm_screen` | A picture of the console, needing nothing inside the guest |
 | `send_vm_key` `send_vm_mouse` | The console's own keyboard and pointer |
@@ -455,6 +455,7 @@ so how far they generalise depends on how much of the guest each one needs.
 | `guest_invoke_command` | PowerShell Direct | Windows only; use `ssh_exec` on Linux |
 | `guest_run_in_session` | PowerShell Direct and a desktop | Windows only |
 | `guest_copy_file` | The Guest Service Interface | Both; Linux needs `hypervfcopyd` |
+| `guest_copy_from` | PowerShell Direct | Windows only; one file at a time |
 
 Give no `width`/`height` to `capture_vm_screen` and it uses the console's own
 resolution, the only size always accepted. A Generation 1 firmware screen is
@@ -664,6 +665,7 @@ Against **Windows Server 2022** (Desktop Experience):
 | `guest_invoke_command` | PowerShell Direct over the VMBus, before the guest had any network service |
 | SSH bootstrap | OpenSSH installed, started, keyed and firewalled entirely over the VMBus, then reached over TCP |
 | `guest_copy_file` | Host to guest over the VMBus |
+| `guest_copy_from` | Guest to host over the VMBus, with size and SHA256 verified |
 | `set_guest_static_ip` | The Windows branch, on a second adapter named `Ethernet 2` |
 | Session bridge | The same query answered as session 0 over PowerShell Direct and session 1 through `guest_run_in_session` |
 | Elevation | An unfiltered administrator token in that session, proven by writing under `HKLM` |

@@ -29,6 +29,9 @@ type Deps struct {
 	Tunnels  *tunnel.Manager
 	Tailnet  *tailnet.Client
 	Log      *logx.Logger
+	// Impersonate runs filesystem work as the connected pipe client. It is set
+	// per MCP connection rather than on the process-wide dependency template.
+	Impersonate func(func() error) error
 }
 
 const instructions = `Controls Hyper-V virtual machines on this Windows host.
@@ -64,7 +67,8 @@ drive Hyper-V's own console devices, so they work whatever the guest runs — or
 even when nothing is running yet. guest_invoke_command and guest_run_in_session
 go through PowerShell Direct and are Windows-only; the Linux equivalent is
 ssh_exec. guest_copy_file works on both, but a Linux guest needs hypervfcopyd
-from hyperv-daemons.
+from hyperv-daemons. guest_copy_from retrieves one file from a Windows guest
+over PowerShell Direct; archive directories first.
 
 A Windows guest can be driven before it has any network at all.
 guest_invoke_command runs a command over the VMBus and gets an unfiltered

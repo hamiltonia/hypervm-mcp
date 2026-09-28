@@ -7,9 +7,16 @@ package winsec
 
 import (
 	"fmt"
+	"net"
+	"os"
+	"runtime"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 )
+
+var impersonateNamedPipeClient = windows.NewLazySystemDLL("advapi32.dll").
+	NewProc("ImpersonateNamedPipeClient")
 
 // CurrentUserSID returns the SID of the account running this process.
 func CurrentUserSID() (string, error) {
@@ -24,6 +31,58 @@ func CurrentUserSID() (string, error) {
 // IsElevated reports whether this process is running with an elevated token.
 func IsElevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
+}
+
+// WithNamedPipeClient runs fn under the token of the client connected to conn.
+//
+// Impersonation is thread-local, so the goroutine is pinned until RevertToSelf
+// completes. This lets filesystem operations enforce the caller's permissions
+// even though the service process itself runs as LocalSystem.
+func WithNamedPipeClient(conn net.Conn, fn func() error) error {
+	hc, ok := conn.(interface{ Fd() uintptr })
+	if !ok {
+		return fmt.Errorf("named pipe connection does not expose its Windows handle")
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var impersonateErr error
+	if r1, _, callErr := impersonateNamedPipeClient.Call(hc.Fd()); r1 == 0 {
+		if callErr != syscall.Errno(0) {
+			impersonateErr = callErr
+		} else {
+			impersonateErr = windows.ERROR_ACCESS_DENIED
+		}
+	}
+	if impersonateErr != nil {
+		return fmt.Errorf("impersonate named pipe client: %w", impersonateErr)
+	}
+
+	impersonating := true
+	defer func() {
+		if impersonating {
+			fatalRevert(windows.RevertToSelf())
+		}
+	}()
+
+	fnErr := fn()
+	if err := windows.RevertToSelf(); err != nil {
+		fatalRevert(err)
+	}
+	impersonating = false
+	return fnErr
+}
+
+func fatalRevert(err error) {
+	if err == nil {
+		return
+	}
+	// Returning this thread to Go's scheduler would let unrelated work run
+	// under the client token. There is no safe recovery inside this process.
+	_, _ = fmt.Fprintf(os.Stderr,
+		"fatal: could not revert named pipe client impersonation: %v\n", err)
+	os.Exit(1)
 }
 
 // ValidateSID checks that s parses as a SID, so a bad --allowed-sid fails at
