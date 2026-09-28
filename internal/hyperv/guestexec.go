@@ -29,7 +29,6 @@ type GuestCopyFromResult struct {
 	SizeBytes        int64  `json:"size_bytes"`
 	SHA256           string `json:"sha256"`
 	LastWriteTimeUTC string `json:"last_write_time_utc"`
-	Overwritten      bool   `json:"overwritten"`
 }
 
 // GuestInvokeCommand runs a command in a Windows guest over PowerShell Direct.

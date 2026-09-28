@@ -261,7 +261,9 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			"or password overrides are supplied. Directories are not copied recursively; archive one " +
 			"inside the guest first, then retrieve the archive.\n\n" +
 			"overwrite defaults to false. create_parents defaults to false. The result includes the " +
-			"guest file size and SHA256, both verified against the host copy." + pathRules,
+			"guest file size and SHA256, both verified against the final host staging file. The host " +
+			"destination is created as the connected user, not as LocalSystem; device paths and " +
+			"existing reparse points are rejected." + pathRules,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in guestCopyFromInput) (*mcp.CallToolResult, *hyperv.GuestCopyFromResult, error) {
 		user, pass, err := guestCredentials(d, in.VMName, in.Username, in.Password)
 		if err != nil {
@@ -271,6 +273,13 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			return nil, nil, hverr.New(hverr.Internal,
 				"the service did not provide a client impersonation context")
 		}
+
+		timeout := time.Duration(in.TimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			timeout = 5 * time.Minute
+		}
+		copyCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 
 		var target *winpath.FileDestination
 		err = d.Impersonate(func() error {
@@ -283,7 +292,9 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			return nil, nil, err
 		}
 		defer func() {
-			_ = d.Impersonate(target.Cleanup)
+			if cleanupErr := d.Impersonate(target.Cleanup); cleanupErr != nil && d.Log != nil {
+				d.Log.Warnf("guest_copy_from staging cleanup failed: %v", cleanupErr)
+			}
 		}()
 
 		serviceStage, err := os.CreateTemp(config.DataDir(), ".guest-copy-from-*.tmp")
@@ -297,10 +308,15 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 			return nil, nil, hverr.Wrap(hverr.PathNotAccessible, err,
 				"could not close protected guest-copy staging file")
 		}
-		defer os.Remove(serviceStagePath)
+		defer func() {
+			if cleanupErr := os.Remove(serviceStagePath); cleanupErr != nil &&
+				!os.IsNotExist(cleanupErr) && d.Log != nil {
+				d.Log.Warnf("guest_copy_from protected staging cleanup failed: %v", cleanupErr)
+			}
+		}()
 
-		out, err := d.VM.GuestCopyFrom(ctx, in.VMName, in.SourcePath, serviceStagePath,
-			user, pass, time.Duration(in.TimeoutSeconds)*time.Second)
+		out, err := d.VM.GuestCopyFrom(copyCtx, in.VMName, in.SourcePath, serviceStagePath,
+			user, pass, timeout)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -312,15 +328,14 @@ func registerGuestTools(s *mcp.Server, d *Deps) {
 		defer serviceStage.Close()
 
 		if err := d.Impersonate(func() error {
-			if err := target.CopyFrom(serviceStage); err != nil {
+			if err := target.CopyFrom(copyCtx, serviceStage, out.SizeBytes, out.SHA256); err != nil {
 				return err
 			}
-			return target.Commit()
+			return target.Commit(copyCtx)
 		}); err != nil {
 			return nil, nil, err
 		}
 		out.Destination = target.Path
-		out.Overwritten = target.Existed
 		return nil, out, err
 	})
 

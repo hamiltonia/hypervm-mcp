@@ -377,9 +377,8 @@ func TestWindowsGuestCopyFrom(t *testing.T) {
 	first := "known guest payload\n"
 	writeGuest(first)
 	var copied struct {
-		SizeBytes   int64  `json:"size_bytes"`
-		SHA256      string `json:"sha256"`
-		Overwritten bool   `json:"overwritten"`
+		SizeBytes int64  `json:"size_bytes"`
+		SHA256    string `json:"sha256"`
 	}
 	call(t, session, ctx, "guest_copy_from", map[string]any{
 		"vm_name":          winVMName,
@@ -394,7 +393,7 @@ func TestWindowsGuestCopyFrom(t *testing.T) {
 	}
 	wantHash := fmt.Sprintf("%x", sha256.Sum256([]byte(first)))
 	if string(got) != first || copied.SizeBytes != int64(len(first)) ||
-		copied.SHA256 != wantHash || copied.Overwritten {
+		copied.SHA256 != wantHash {
 		t.Fatalf("copy metadata/content mismatch: content=%q result=%+v want sha256=%s", got, copied, wantHash)
 	}
 
@@ -419,7 +418,7 @@ func TestWindowsGuestCopyFrom(t *testing.T) {
 		t.Fatalf("read overwritten file: %v", err)
 	}
 	wantHash = fmt.Sprintf("%x", sha256.Sum256([]byte(second)))
-	if string(got) != second || copied.SHA256 != wantHash || !copied.Overwritten {
+	if string(got) != second || copied.SHA256 != wantHash {
 		t.Fatalf("overwrite mismatch: content=%q result=%+v want sha256=%s", got, copied, wantHash)
 	}
 }

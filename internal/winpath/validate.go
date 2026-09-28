@@ -10,11 +10,18 @@
 package winpath
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 
@@ -25,7 +32,20 @@ import (
 const (
 	driveNoRootDir = 1
 	driveRemote    = 4
+
+	deleteAccess         = 0x00010000
+	fileRenameInfoClass  = 3
+	renameReplaceIfExist = 1
 )
+
+var setFileInformationByHandle = windows.NewLazySystemDLL("kernel32.dll").
+	NewProc("SetFileInformationByHandle")
+
+type fileRenameInfo struct {
+	Flags          uint32
+	RootDirectory  windows.Handle
+	FileNameLength uint32
+}
 
 // Mode says what the caller intends to do with the path.
 type Mode int
@@ -45,7 +65,6 @@ const (
 type FileDestination struct {
 	Path        string
 	StagingPath string
-	Existed     bool
 	overwrite   bool
 	stagingFile *os.File
 }
@@ -56,10 +75,6 @@ type FileDestination struct {
 func Validate(path string, mode Mode, createParents bool) (string, error) {
 	if path == "" {
 		return "", hverr.New(hverr.InvalidArgument, "path is required")
-	}
-	if isDevicePath(path) {
-		return "", hverr.New(hverr.InvalidArgument,
-			"%q is a device path, not a filesystem path", path)
 	}
 	if !filepath.IsAbs(path) {
 		// A relative path resolves against the service's working directory,
@@ -112,7 +127,14 @@ func Validate(path string, mode Mode, createParents bool) (string, error) {
 // unprivileged caller could redirect a write into a more privileged location.
 // Reject every existing reparse point from the volume root through the leaf.
 func ValidateFileDestination(path string, createParents bool) (string, error) {
-	if path == "" || isDevicePath(path) || !filepath.IsAbs(path) {
+	if path == "" {
+		return Validate(path, Create, createParents)
+	}
+	if isDevicePath(path) {
+		return "", hverr.New(hverr.InvalidArgument,
+			"%q is a device path, not a filesystem path", path)
+	}
+	if !filepath.IsAbs(path) {
 		return Validate(path, Create, createParents)
 	}
 	clean := filepath.Clean(path)
@@ -143,11 +165,10 @@ func PrepareFileDestination(path string, createParents, overwrite bool) (*FileDe
 		return nil, err
 	}
 
-	existed, err := inspectDestination(clean, overwrite)
-	if err != nil {
+	if err := inspectDestination(clean, overwrite); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(filepath.Dir(clean), ".hypervm-mcp-copy-*.tmp")
+	f, err := createRenameableTemp(filepath.Dir(clean))
 	if err != nil {
 		return nil, hverr.Wrap(hverr.PathNotAccessible, err,
 			"could not create a staging file in %s", filepath.Dir(clean))
@@ -155,7 +176,6 @@ func PrepareFileDestination(path string, createParents, overwrite bool) (*FileDe
 	return &FileDestination{
 		Path:        clean,
 		StagingPath: f.Name(),
-		Existed:     existed,
 		overwrite:   overwrite,
 		stagingFile: f,
 	}, nil
@@ -163,28 +183,73 @@ func PrepareFileDestination(path string, createParents, overwrite bool) (*FileDe
 
 // CopyFrom fills the caller-created staging file through its retained handle.
 // It must run while impersonating the pipe client.
-func (d *FileDestination) CopyFrom(src io.Reader) error {
+func (d *FileDestination) CopyFrom(ctx context.Context, src io.Reader, expectedSize int64, expectedSHA256 string) error {
 	if d.stagingFile == nil {
 		return hverr.New(hverr.Internal, "destination staging file is not open")
 	}
-	if _, err := io.Copy(d.stagingFile, src); err != nil {
+	stopCancel := make(chan struct{})
+	go func(f *os.File) {
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+		case <-stopCancel:
+		}
+	}(d.stagingFile)
+	defer close(stopCancel)
+
+	written, err := copyWithContext(ctx, d.stagingFile, src)
+	if err != nil {
 		d.stagingFile.Close()
 		d.stagingFile = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return hverr.Wrap(hverr.PathNotAccessible, err,
 			"could not write staging file for %s", d.Path)
+	}
+	if written != expectedSize {
+		d.stagingFile.Close()
+		d.stagingFile = nil
+		return hverr.New(hverr.Internal,
+			"the final host staging file did not match the guest size")
 	}
 	if err := d.stagingFile.Sync(); err != nil {
 		d.stagingFile.Close()
 		d.stagingFile = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return hverr.Wrap(hverr.PathNotAccessible, err,
 			"could not flush staging file for %s", d.Path)
 	}
-	if err := d.stagingFile.Close(); err != nil {
+	if _, err := d.stagingFile.Seek(0, io.SeekStart); err != nil {
+		d.stagingFile.Close()
 		d.stagingFile = nil
 		return hverr.Wrap(hverr.PathNotAccessible, err,
-			"could not close staging file for %s", d.Path)
+			"could not verify staging file for %s", d.Path)
 	}
-	d.stagingFile = nil
+	hash := sha256.New()
+	verifiedSize, err := copyWithContext(ctx, hash, d.stagingFile)
+	if err != nil {
+		d.stagingFile.Close()
+		d.stagingFile = nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return hverr.Wrap(hverr.PathNotAccessible, err,
+			"could not verify staging file for %s", d.Path)
+	}
+	if verifiedSize != expectedSize || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+		d.stagingFile.Close()
+		d.stagingFile = nil
+		return hverr.New(hverr.Internal,
+			"the final host staging file did not match the guest size and SHA256")
+	}
+	if err := ctx.Err(); err != nil {
+		d.stagingFile.Close()
+		d.stagingFile = nil
+		return err
+	}
 	return nil
 }
 
@@ -204,65 +269,120 @@ func (d *FileDestination) Cleanup() error {
 }
 
 // Commit revalidates the destination and moves the staged file into place.
-func (d *FileDestination) Commit() error {
-	if d.stagingFile != nil {
-		return hverr.New(hverr.Internal, "destination staging file is still open")
+func (d *FileDestination) Commit(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d.stagingFile == nil {
+		return hverr.New(hverr.Internal, "destination staging file is not open")
 	}
 	if _, err := ValidateFileDestination(d.Path, false); err != nil {
 		return err
 	}
-	if _, err := inspectDestination(d.Path, d.overwrite); err != nil {
-		return err
-	}
-	if err := rejectReparsePoints(d.StagingPath); err != nil {
+	if err := inspectDestination(d.Path, d.overwrite); err != nil {
 		return err
 	}
 
-	from, err := windows.UTF16PtrFromString(d.StagingPath)
-	if err != nil {
-		return hverr.Wrap(hverr.InvalidArgument, err, "invalid staging path")
-	}
-	to, err := windows.UTF16PtrFromString(d.Path)
-	if err != nil {
-		return hverr.Wrap(hverr.InvalidArgument, err, "invalid destination path")
-	}
-	if d.overwrite {
-		err = windows.MoveFileEx(from, to,
-			windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
-	} else {
-		err = windows.MoveFile(from, to)
-	}
-	if err != nil {
-		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) ||
-			errors.Is(err, windows.ERROR_FILE_EXISTS) {
+	if err := renameOpenFile(d.stagingFile, d.Path, d.overwrite); err != nil {
+		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_FILE_EXISTS) {
 			return hverr.New(hverr.VMAlreadyExists,
 				"%s already exists; pass overwrite to replace it", d.Path)
 		}
 		return hverr.Wrap(hverr.PathNotAccessible, err,
 			"could not move the copied file to %s", d.Path)
 	}
+	if err := d.stagingFile.Close(); err != nil {
+		d.stagingFile = nil
+		return hverr.Wrap(hverr.PathNotAccessible, err,
+			"could not close the copied file at %s", d.Path)
+	}
+	d.stagingFile = nil
 	return nil
 }
 
-func inspectDestination(path string, overwrite bool) (bool, error) {
+func inspectDestination(path string, overwrite bool) error {
 	info, err := os.Lstat(path)
 	switch {
 	case err == nil:
 		if info.IsDir() {
-			return false, hverr.New(hverr.InvalidArgument,
+			return hverr.New(hverr.InvalidArgument,
 				"%s is a directory; destination_path must name a file", path)
 		}
+
 		if !overwrite {
-			return false, hverr.New(hverr.VMAlreadyExists,
+			return hverr.New(hverr.VMAlreadyExists,
 				"%s already exists; pass overwrite to replace it", path)
 		}
-		return true, nil
+		return nil
 	case os.IsNotExist(err):
-		return false, nil
+		return nil
 	default:
-		return false, hverr.Wrap(hverr.PathNotAccessible, err,
+		return hverr.Wrap(hverr.PathNotAccessible, err,
 			"could not inspect %s", path)
 	}
+}
+
+func createRenameableTemp(dir string) (*os.File, error) {
+	for range 100 {
+		var random [16]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, err
+		}
+		path := filepath.Join(dir, fmt.Sprintf(".hypervm-mcp-copy-%x.tmp", random))
+		ptr, err := windows.UTF16PtrFromString(path)
+		if err != nil {
+			return nil, err
+		}
+		handle, err := windows.CreateFile(
+			ptr,
+			windows.GENERIC_READ|windows.GENERIC_WRITE|deleteAccess,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE,
+			nil,
+			windows.CREATE_NEW,
+			windows.FILE_ATTRIBUTE_NORMAL,
+			0,
+		)
+		if errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return os.NewFile(uintptr(handle), path), nil
+	}
+	return nil, windows.ERROR_FILE_EXISTS
+}
+
+func renameOpenFile(file *os.File, destination string, overwrite bool) error {
+	name, err := windows.UTF16FromString(destination)
+	if err != nil {
+		return err
+	}
+	name = name[:len(name)-1]
+
+	var layout fileRenameInfo
+	nameOffset := unsafe.Offsetof(layout.FileNameLength) + unsafe.Sizeof(layout.FileNameLength)
+	buf := make([]byte, int(nameOffset)+len(name)*2)
+	info := (*fileRenameInfo)(unsafe.Pointer(&buf[0]))
+	if overwrite {
+		info.Flags = renameReplaceIfExist
+	}
+	info.FileNameLength = uint32(len(name) * 2)
+	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[nameOffset])), len(name)), name)
+
+	r1, _, callErr := setFileInformationByHandle.Call(
+		file.Fd(),
+		fileRenameInfoClass,
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if r1 != 0 {
+		return nil
+	}
+	if callErr != syscall.Errno(0) {
+		return callErr
+	}
+	return windows.ERROR_ACCESS_DENIED
 }
 
 // ValidateDir is Validate for a directory the caller wants to write into.
@@ -270,13 +390,10 @@ func ValidateDir(path string, createParents bool) (string, error) {
 	if path == "" {
 		return "", hverr.New(hverr.InvalidArgument, "path is required")
 	}
-	if isDevicePath(path) {
-		return "", hverr.New(hverr.InvalidArgument,
-			"%q is a device path, not a filesystem path", path)
-	}
 	if !filepath.IsAbs(path) {
 		return "", hverr.New(hverr.InvalidArgument, "%q must be an absolute path", path)
 	}
+
 	clean := filepath.Clean(path)
 
 	if err := checkVolume(clean); err != nil {
@@ -295,6 +412,36 @@ func ValidateDir(path string, createParents bool) (string, error) {
 		return "", err
 	}
 	return clean, nil
+}
+
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, 128*1024)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		nr, readErr := src.Read(buf)
+		if nr > 0 {
+			if err := ctx.Err(); err != nil {
+				return written, err
+			}
+			nw, writeErr := dst.Write(buf[:nr])
+			written += int64(nw)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
 }
 
 func isDevicePath(path string) bool {

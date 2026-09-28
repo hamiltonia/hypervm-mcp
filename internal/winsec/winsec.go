@@ -8,6 +8,7 @@ package winsec
 import (
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"syscall"
 
@@ -58,15 +59,30 @@ func WithNamedPipeClient(conn net.Conn, fn func() error) error {
 		return fmt.Errorf("impersonate named pipe client: %w", impersonateErr)
 	}
 
-	var fnErr, revertErr error
-	func() {
-		defer func() { revertErr = windows.RevertToSelf() }()
-		fnErr = fn()
+	impersonating := true
+	defer func() {
+		if impersonating {
+			fatalRevert(windows.RevertToSelf())
+		}
 	}()
-	if revertErr != nil {
-		return fmt.Errorf("revert named pipe client impersonation: %w", revertErr)
+
+	fnErr := fn()
+	if err := windows.RevertToSelf(); err != nil {
+		fatalRevert(err)
 	}
+	impersonating = false
 	return fnErr
+}
+
+func fatalRevert(err error) {
+	if err == nil {
+		return
+	}
+	// Returning this thread to Go's scheduler would let unrelated work run
+	// under the client token. There is no safe recovery inside this process.
+	_, _ = fmt.Fprintf(os.Stderr,
+		"fatal: could not revert named pipe client impersonation: %v\n", err)
+	os.Exit(1)
 }
 
 // ValidateSID checks that s parses as a SID, so a bad --allowed-sid fails at

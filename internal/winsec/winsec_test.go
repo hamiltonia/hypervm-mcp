@@ -57,7 +57,7 @@ func TestWithNamedPipeClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.Close()
+	defer client.Close()
 
 	select {
 	case err := <-accepted:
