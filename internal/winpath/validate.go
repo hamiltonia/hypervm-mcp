@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -33,13 +32,12 @@ const (
 	driveNoRootDir = 1
 	driveRemote    = 4
 
-	deleteAccess         = 0x00010000
-	fileRenameInfoClass  = 3
-	renameReplaceIfExist = 1
+	deleteAccess            = 0x00010000
+	fileRenameInformation   = 10
+	fileRenameInformationEx = 65
+	renameReplaceIfExist    = 1
+	renamePOSIXSemantics    = 2
 )
-
-var setFileInformationByHandle = windows.NewLazySystemDLL("kernel32.dll").
-	NewProc("SetFileInformationByHandle")
 
 type fileRenameInfo struct {
 	Flags          uint32
@@ -354,7 +352,13 @@ func createRenameableTemp(dir string) (*os.File, error) {
 }
 
 func renameOpenFile(file *os.File, destination string, overwrite bool) error {
-	name, err := windows.UTF16FromString(destination)
+	dir, err := os.Open(filepath.Dir(destination))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	name, err := windows.UTF16FromString(filepath.Base(destination))
 	if err != nil {
 		return err
 	}
@@ -364,25 +368,41 @@ func renameOpenFile(file *os.File, destination string, overwrite bool) error {
 	nameOffset := unsafe.Offsetof(layout.FileNameLength) + unsafe.Sizeof(layout.FileNameLength)
 	buf := make([]byte, int(nameOffset)+len(name)*2)
 	info := (*fileRenameInfo)(unsafe.Pointer(&buf[0]))
+	info.RootDirectory = windows.Handle(dir.Fd())
 	if overwrite {
-		info.Flags = renameReplaceIfExist
+		info.Flags = renameReplaceIfExist | renamePOSIXSemantics
 	}
 	info.FileNameLength = uint32(len(name) * 2)
 	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buf[nameOffset])), len(name)), name)
 
-	r1, _, callErr := setFileInformationByHandle.Call(
-		file.Fd(),
-		fileRenameInfoClass,
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(len(buf)),
+	var status windows.IO_STATUS_BLOCK
+	err = windows.NtSetInformationFile(
+		windows.Handle(file.Fd()),
+		&status,
+		&buf[0],
+		uint32(len(buf)),
+		fileRenameInformationEx,
 	)
-	if r1 != 0 {
+	if err == nil {
 		return nil
 	}
-	if callErr != syscall.Errno(0) {
-		return callErr
+
+	if overwrite {
+		info.Flags = renameReplaceIfExist
+	} else {
+		info.Flags = 0
 	}
-	return windows.ERROR_ACCESS_DENIED
+	err = windows.NtSetInformationFile(
+		windows.Handle(file.Fd()),
+		&status,
+		&buf[0],
+		uint32(len(buf)),
+		fileRenameInformation,
+	)
+	if status, ok := err.(windows.NTStatus); ok {
+		return status.Errno()
+	}
+	return err
 }
 
 // ValidateDir is Validate for a directory the caller wants to write into.
